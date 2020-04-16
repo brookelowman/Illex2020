@@ -1,0 +1,890 @@
+---
+  title: "Illex Data Product #1"
+author: "Brooke Wright"
+date: "January 2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+  
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require("knitr")
+opts_knit$set(root.dir = "C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FI_surveys") #set the working directory to the Illex project folder
+setwd("C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FI_surveys")
+# opts_knit$set(root.dir = "/net/home3/ajones/VASTbrooke/FI_surveys") #set the working directory to the Illex project folder
+# setwd("/net/home3/ajones/VASTbrooke/FI_surveys")
+```
+
+```{r, create directory for model output}
+DateFile = paste0(getwd(),'/NEFSC_fallBTS_VAST_output/mod1_02_03_01') #this is where the outputs will be saved
+# DateFile = paste0('/net/home3/ajones/VASTbrooke/FI_surveys/NEFSC_fallBTS_VAST_output/mod1_02_03_01/update04-01') #this is where the outputs will be saved
+#dir.create(DateFile)  #only have to create this directory the first time
+
+```
+
+```{r, load packages}
+library(TMB)
+library(VAST) 
+library(tidyverse)
+library(rgdal)
+library(rgeos)
+library(ggvoronoi)
+library(sf)
+library(lwgeom)
+library(knitr)
+library(mapdata)
+```
+
+```{r, load and format the data}
+load("./FICatchData/FIsurveydata_formatted.Rdata")
+
+# NWA_illex_data <- NMFSfall
+NWA_illex_data <- rbind(NMFSfall
+                        , NEAMAP
+                        , MENH
+                        # , MAfall
+                        # , RITRAWL
+                        # , NYTRAWL
+                        # , NJTRAWL
+                        ) 
+
+for(i in 1:nrow(NWA_illex_data)){
+  NWA_illex_data$PresJitter[i] = ifelse(NWA_illex_data$Pres[i] == 0, 0, 1 + rnorm(n=1, mean=0, sd= 0.001)) #follow Thorson's recommendation to jitter presence by very small amount so VAST will estimate a logistic regression model
+}
+NWA_illex_data$Year <- as.numeric(as.character(NWA_illex_data$Year))
+NWA_illex_data$Vessel <- as.factor(NWA_illex_data$Vessel)
+Data_Set <- NWA_illex_data
+str(Data_Set)
+
+```
+
+## https://github.com/James-Thorson-NOAA/VAST
+
+Define spatial and model settings.
+```{r, spatial and model settings}
+Version = get_latest_version(package="VAST")
+
+#spatial settings
+Method = c("Grid", "Mesh", "Spherical_mesh")[2] #specify the way values of random effects are assigned -- "Mesh" allows for anisotropy
+grid_size_km = 25  #this was 25 in the example; smaller number leads to slower run time
+n_x = 100   # Specify the number of knots (i.e. sample locations) to use in defining spatial variables. Start with 50-100 while tinkering with the model (to speed up run time) and increase knots to increase spatial resolution of the predictions.
+Kmeans_Config = list("randomseed" = 1, "nstart" = 100, "iter.max" = 1e3 ) #
+
+#model settings
+FieldConfig = c("Omega1"=1, "Epsilon1"=1, "Omega2"=0, "Epsilon2"=0) #number of spatial factors (Omegas) and spatio-temporal factors (Epsilons) for the probability (_1) and positive catch (_2) linear predictors
+
+RhoConfig = c("Beta1"=0, "Beta2"=3, "Epsilon1"=0, "Epsilon2"=0) #Specify temporal structure of intercepts and spatio-temporal variation. Beta1= Beta2= 0 is default and treats each intercept as a fixed effect. Epsilon1= Epsilon2= 0 is default and treats each vector of spatio-temporal random effects as independent among years. #set beta2=3 to have a fixed effect constant among years for the positive catch component when using only encounter/non-encounter data
+
+OverdispersionConfig = c("Eta1"=1, "Eta2"=0) #Specify the number of catchability factors for each component. 0 turns off the random covariation in catchability. 1 gives one random effect for each unique [vessel] level.
+
+ObsModel = c(2,0)  #specify distribution of positive catches (2=Gamma) and link functions (0=logit for probablility and log for positive catches)
+
+Options =  c("SD_site_density"=0,
+             "SD_site_logdensity"=0,
+             "Calculate_Range"=1,
+             "Calculate_evenness"=0,
+             "Calculate_effective_area"=1,
+             "Calculate_Cov_SE"=0,
+             'Calculate_Synchrony'=0,
+             'Calculate_Coherence'=0,
+             'normalize_GMRF_in_CPP'=TRUE)
+
+#stratification
+# For NEFSC indices, strata must be specified as a named list of area codes
+#strata.limits = list('STRATA' = c(seq(1130,1300,10), seq(1360,1400,10)))  #strata 13:30, 36:40
+strata.limits = list('STRATA' = "All_areas")
+
+Region = "Other" #automatically attempts to define reasonable settings based on the location of sampling #alternatively, could specify "Nortwest Atlantic"
+# Region = "Northwest_Atlantic" # need to add to extrapolation grid to run with inshore surveys
+
+```
+
+```{r, save the settings for future use}
+Record = ThorsonUtilities::bundlelist(c("Data_Set"
+                                        , "Version"
+                                        , "Method"
+                                        , "grid_size_km"
+                                        , "n_x"
+                                        , "Kmeans_Config"
+                                        , "FieldConfig"
+                                        , "RhoConfig"
+                                        , "OverdispersionConfig" 
+                                        , "ObsModel"
+                                        , "Options"
+))
+save(Record, file=file.path(DateFile, "Record.RData"))
+capture.output(Record, file=paste0(DateFile, "/Record.txt"))
+```
+
+```{r, make extrapolation grid}
+Extrapolation_List <- make_extrapolation_info(Region=Region, 
+                                              strata.limits=as.data.frame(strata.limits), 
+                                              observations_LL = NWA_illex_data[,c('Lat','Lon')], 
+                                              maximum_distance_from_sample=15)
+
+```
+
+```{r, derived objects}
+Spatial_List <- make_spatial_info(grid_size_km=grid_size_km, 
+                                  n_x=n_x, 
+                                  Method=Method, 
+                                  Lon=NWA_illex_data[,'Lon'], 
+                                  Lat=NWA_illex_data[,'Lat'], 
+                                  Extrapolation_List=Extrapolation_List,
+                                  fine_scale = TRUE,
+                                  DirPath=DateFile, Save_Results=FALSE )
+# Add knots to NEFSC.fall
+NWA_illex_data <- cbind(NWA_illex_data, "knot_i"=Spatial_List$knot_i)
+
+```
+
+```{r, enviro variables}
+# Turn off this whole section until the base model works.
+# #TP addtion: add habitat variables -----
+
+# xvars <- c("depth", "bottom_temp")
+# years <- unique(NWA_illex_data$Year)
+# knots <- unique(NWA_illex_data$knot_i)
+# xes <- data.frame(Year = NWA_illex_data$Year, #for each year
+#                   knot_i = NWA_illex_data$knot_i, #for each observation, get the nearest knot
+#                   depth = scale(NWA_illex_data$Depth), #assign the depth value
+#                   bottom.temp = scale(NWA_illex_data$BottomTemp_C)) #assign the bot temp value
+# xes2 <- data.frame(Year = rep(years, each=length(knots)), #for each year
+#                    knot_i = knots, #for each knot, 
+#                    depth = mean(xes$depth), #assign the mean depth
+#                    bottom.temp = mean(xes$bottom.temp)) #assign the mean bot temp
+# xes<-rbind(xes,xes2) #combine the observations and averages into a single dataframe
+# xes<-xes[order(xes$Year,xes$knot_i), ] #rearrange the dataframe
+# x_matrix <- array(dim=c(length(unique(Spatial_List$knot_i)),length(unique(xes$Year)),length(xvars))) #make an array with rows=number of knots, columns=number of years, tiers= number of habitat variables
+# 
+# x_matrix[,,1] <- with(xes, tapply(depth, list(knot_i, Year), mean, na.rm=TRUE)) #fill tier 1 of the array with depth
+# x_matrix[,,2] <- with(xes,tapply(bottom.temp, list(knot_i, Year), mean,na.rm=TRUE)) #fill tier 2 of the array with bot temp
+# 
+# # x_matrix <- as.data.frame(x_matrix)
+
+```
+
+Make the TMB-compatible data file, make a list of components needed to assemble the TMB function, configure settings, assign a destination to save the output. This part takes some time.
+```{r, build and run the model}
+
+TmbData = make_data(
+  # "b_i" = NWA_illex_data[ ,'Catch_KG'], 
+  "b_i" = NWA_illex_data[ ,'PresJitter'], 
+  "a_i" = NWA_illex_data[ ,'AreaSwept_km2'], 
+  "t_iz" = NWA_illex_data[ ,'Year'],
+  "c_i" = rep(0, nrow(NWA_illex_data)), 
+  # "e_i" = c_i,
+  "v_i" = as.numeric(NWA_illex_data[,'Vessel'])-1,
+  "FieldConfig" = FieldConfig,
+  # "s_i" = NWA_illex_data[ ,'knot_i']-1, 
+  "spatial_list" = Spatial_List, 
+  "ObsModel"= ObsModel, #specify distribution of positive catches (2=Gamma) and link functions (0=logit for probablility and log for positive)
+  "OverdispersionConfig" = OverdispersionConfig,
+  "RhoConfig" = RhoConfig,
+  # "VamConfig" = c(,,) #option to estimate interactions,
+  # "Aniso" = 1, # use 0 for isotropy or 1 for geometic anisotropy
+  # "PredTF_i" = c() #optional each observation i is included in the likelihood (0) or in the predictive probability (1)
+  # "Xconfig_zcp" = c() #optional 3D array of settings for each dynamic density covariate
+  # "covariate_data" = NWA_illex_data,
+  # "formula" =  ~ Depth_M,
+  # "MeshList" = Spatial_List$MeshList, 
+  # "GridList" = Spatial_List$GridList, 
+  # "Method" = Spatial_List$Method, 
+  "Options" = Options,
+  "Version" = Version
+)
+
+
+TmbList = VAST::make_model("TmbData"=TmbData, 
+                           "RunDir"=DateFile, 
+                           "Version"=Version, 
+                           "RhoConfig"=RhoConfig, 
+                           "loc_x"=Spatial_List$loc_x, 
+                           "Method"=Method)
+
+Obj = TmbList[["Obj"]]
+
+Opt = TMBhelper::Optimize(obj=Obj, 
+                          lower=TmbList[["Lower"]], 
+                          upper=TmbList[["Upper"]], 
+                          getsd=TRUE, 
+                          savedir=DateFile, 
+                          bias.correct=TRUE, 
+                          newtonsteps=1, 
+                          bias.correct.control=list(sd=FALSE, split=NULL, nsplit=1, vars_to_correct="Index_cyl") )
+
+Report = Obj$report()
+Save = list("Opt"=Opt, "Report"=Report, "ParHat"=Obj$env$parList(Opt$par), "TmbData"=TmbData)
+save(Save, file=paste0(DateFile, "/Save.RData"))
+
+```
+
+Run some basic diagnostics, plot the location data, plot observed encounter frequency against predicted probability, QQ and other diagnostic plots for positive catch data.
+```{r, outputs and diagnostics}
+
+#Convergence
+pander::pandoc.table(Opt$diagnostics[,c('Param','Lower','MLE','Upper','final_gradient')])
+write.csv(as.data.frame(Opt$diagnostics[,c('Param','Lower','MLE','Upper','final_gradient')]), file=file.path(DateFile, "parameterestimates.csv"), row.names = FALSE)
+# The lower and upper values are the parameter bounds. Make sure that the MLE is not hitting them. Make sure final_gradient is near zero.
+## -- looks good :)
+
+#Plot location data
+plot_data(Extrapolation_List=Extrapolation_List, 
+          Spatial_List=Spatial_List, 
+          Data_Geostat=NWA_illex_data, 
+          PlotDir=DateFile )
+
+#Diagnostic for encounter probability
+Enc_prob = plot_encounter_diagnostic(Report=Report, 
+                                     Data_Geostat=NWA_illex_data, 
+                                     DirName=DateFile)
+## Some observations of high (>0.8) and low (<0.35) encounter frequency fall slightly outside of the predictions.
+
+
+#Diagnostic for positive catch rate component
+Q = plot_quantile_diagnostic( TmbData=TmbData, 
+                              Report=Report, 
+                              FileName_PP="Posterior_Predictive",
+                              FileName_Phist="Posterior_Predictive-Histogram", 
+                              FileName_QQ="Q-Q_plot", 
+                              FileName_Qhist="Q-Q_hist", 
+                              DateFile=DateFile )
+
+```
+
+```{r, settings for maps}
+MapDetails_List = make_map_info(Region=Region
+                                , NN_Extrap = Spatial_List$PolygonList$NN_Extrap
+                                , spatial_list = Spatial_List
+                                , Extrapolation_List = Extrapolation_List
+                                , fine_scale = Spatial_List$fine_scale)
+
+# Decide which years to plot                                                   
+Year_Set = seq(min(NWA_illex_data[,'Year']),
+               max(NWA_illex_data[,'Year']))
+Years2Include = which(Year_Set %in% sort(unique(NWA_illex_data[,'Year'])))
+```
+
+```{r, plot residuals}
+plot_residuals(Lat_i=NWA_illex_data[,'Lat'], 
+               Lon_i=NWA_illex_data[,'Lon'], 
+               TmbData=TmbData, 
+               Report=Report, 
+               Q=Q, 
+               # projargs = "+proj=longlat",
+               working_dir=DateFile,
+               spatial_list = Spatial_List,
+               extrapolation_list = Extrapolation_List,
+               Year_Set=Year_Set, 
+               Years2Include=Years2Include,   
+               # MappingDetails=MapDetails_List[["MappingDetails"]], 
+               # PlotDF=MapDetails_List[["PlotDF"]], 
+               # MapSizeRatio=MapDetails_List[["MapSizeRatio"]], 
+               # Xlim=MapDetails_List[["Xlim"]], 
+               # Ylim=MapDetails_List[["Ylim"]], 
+               # FileName=DateFile, 
+               # Rotate=MapDetails_List[["Rotate"]], 
+               # Cex=MapDetails_List[["Cex"]], 
+               # Legend=MapDetails_List[["Legend"]], 
+               # zone=MapDetails_List[["Zone"]], 
+               mar=c(0,0,2,0), 
+               oma=c(3.5,3.5,0,0), 
+               cex=1.8)
+```
+
+```{r, anisotropy}
+#How do the properties change across directions? e.g. are locations more similar north-to-south vs east-to-west?
+plot_anisotropy( FileName=paste(DateFile,"Aniso.png", sep="/"), 
+                 Report=Report, 
+                 TmbData=TmbData )
+```
+
+```{r, encounter probability}
+Dens_xt = plot_maps(plot_set = 1 #set 1 is the probability of encounter
+                    # , MappingDetails=MapDetails_List[["MappingDetails"]]
+                    , Report = Report
+                    , Sdreport = Opt$SD
+                    , Panel = "Category"
+                    , Year_Set = Year_Set
+                    , Years2Include = Years2Include
+                    # , category_names = c()
+                    , MapSizeRatio = MapDetails_List[["MapSizeRatio"]]
+                    , working_dir = DateFile
+                    , PlotDF = MapDetails_List[["PlotDF"]]
+                    # , Xlim = MapDetails_List[["Xlim"]]
+                    # , Ylim = MapDetails_List[["Ylim"]]
+                    # , Rotate = MapDetails_List[["Rotate"]]
+                    # , Cex = MapDetails_List[["Cex"]]
+                    # , Legend = MapDetails_List[["Legend"]]
+                    # , zone = MapDetails_List[["Zone"]]
+                    , mar = c(0,0,2,0)
+                    , oma = c(3.5,3.5,0,0)
+                    , cex = 1.8
+                    # , plot_legend_fig = FALSE
+)
+
+# Dens_DF = cbind( "Density"=as.vector(Dens_xt),
+#                  "Year"=Year_Set[col(Dens_xt)],
+#                  "E_km"=Spatial_List$MeshList$loc_x[row(Dens_xt),'E_km'],
+#                  "N_km"=Spatial_List$MeshList$loc_x[row(Dens_xt),'N_km'] )
+
+# pander::pandoc.table( Dens_DF[1:6,], digits=3 )
+```
+
+```{r, biomass index}
+Index = plot_biomass_index( DirName=DateFile, 
+                            TmbData=TmbData, 
+                            Sdreport=Opt[["SD"]], 
+                            Year_Set=Year_Set, 
+                            Years2Include=Years2Include, 
+                            use_biascorr=TRUE )
+pander::pandoc.table( Index$Table[,c("Year","Fleet","Estimate_metric_tons","SD_log","SD_mt")] ) 
+
+write.csv(as.data.frame(Index$Table[,c("Year","Fleet","Estimate_metric_tons","SD_log","SD_mt")]), file=file.path(DateFile, "diagnostics.csv"), row.names = FALSE)
+
+plot_range_index(Report=Report, 
+                 TmbData=TmbData, 
+                 Sdreport=Opt[["SD"]], 
+                 Znames=colnames(TmbData$Z_xm), 
+                 PlotDir=DateFile, 
+                 Year_Set=Year_Set)
+```
+
+```{r, save workspace}
+save(Record, file=paste0(DateFile, "/Record.RData"))
+save.image(file=paste0(DateFile, "/SaveAll.Rdata"))
+
+```
+
+Save the probability values in a convenient format for plotting.
+```{r, save probability map values}
+probmapval <- as.data.frame(Save$Report$R1_gcy)
+
+colnames(probmapval) <- paste0(rep("Prob", ncol(probmapval)),Year_Set)
+  
+probcoords <- filter(MapDetails_List$PlotDF, Include==TRUE)[,1:2]
+
+probmap <- cbind(probcoords, probmapval)
+coordinates(probmap) <- c("Lat", "Lon")
+
+```
+
+Method 1 for making the probabililty occupancy map.
+```{r, method 1 prob map}
+
+# ggplot(data= as.data.frame(probmap), aes(x=Lon, y=Lat, color=Prob2001)) + geom_point()
+# ggplot(data= filter(as.data.frame(probmap), X2001>=0.8) , aes(x=Lon, y=Lat, color=X2001)) + geom_point()
+
+
+# probDF<- as.data.frame(probmap)[, 1:3]
+# 
+# # probsf <- probDF %>% st_as_sf(coords=c('Lon','Lat')) #%>% 
+# # st_cast(probsf, to = 'POLYGON')
+# # st_cast(probsf, list = c('Lon','Lat'), 'POLYGON', group_or_split = FALSE)
+# 
+# probDFhull <- chull(probDF$Lon, probDF$Lat)
+# # probDFhull <- cbind(probDF$Lon[probDFhull], probDF$Lat[probDFhull])
+# coords <- probDF[c(probDFhull, probDFhull[1]), ]
+# 
+# rm(probmapval, probcoords)
+# 
+# 
+# EPSG <- make_EPSG() #create a dataframe of available EPSG codes
+# EPSG[grepl("WGS 84$", EPSG$note), ] #look up the codes corresponding to WGS84
+# prj4wgs <- "+proj=geocent +datum=WGS84 +units=m +no_defs"
+
+```
+
+Read in the EPU shapefile, get the area, and transform the projection to Mercator.
+```{r, read EPU shapefile(s)}
+
+#Loading a shape file of the EPUs
+# epu_shp <- st_read(file.path('Z:/VASTbrooke/EPU_shapefile',"EPU_extended.shp"),quiet = T)  
+epu_shp <- st_read(file.path('/net/home3/ajones/VASTbrooke/EPU_shapefile',"EPU_extended.shp"),quiet = T)  
+plot(epu_shp)
+#Converting shape to one big area
+epu_shp$area <- st_area(epu_shp)
+NESLME <- epu_shp %>% summarise(area = sum(area)) 
+
+NESLME.mercator <- st_transform(NESLME, crs=CRS("+proj=utm +zone=19 +datum=WGS84"))
+
+NESLME %>% plot()
+
+lmepts <- as.data.frame(st_coordinates(NESLME))
+# NESLME <- st_coordinates(NESLME)
+
+```
+
+```{r, make voronoi diagram}
+# function to create a polygon from the boundary box:
+bbox_polygon <- function(x) {
+  bb <- sf::st_bbox(x)
+
+  p <- matrix(
+    c(bb["xmin"], bb["ymin"], 
+      bb["xmin"], bb["ymax"],
+      bb["xmax"], bb["ymax"], 
+      bb["xmax"], bb["ymin"], 
+      bb["xmin"], bb["ymin"]),
+    ncol = 2, byrow = T
+  )
+
+  sf::st_polygon(list(p))
+}
+
+probmapdf <- as.data.frame(probmap)
+vorsf <- st_as_sf(probmapdf, coords= c("Lon", "Lat")) #convert dataframe to simple feature object
+str(vorsf)
+st_crs(vorsf) <- 4326 #this is the EPSG code for WGS84 coordinate system
+vorsf.mercator <- st_transform(vorsf, crs=CRS("+proj=utm +zone=19 +datum=WGS84")) #transform to mercator projection
+
+bb <- sf::st_bbox(vorsf)
+
+vorbox <- st_sfc(bbox_polygon(vorsf)) # create a simple feature geometry list column on the boundary box polygon
+head(vorsf)
+head(st_union(vorsf))
+
+vor <- st_voronoi(st_union(vorsf.mercator), vorbox)
+# plot(vor, col = 0)
+vorclip <- st_intersection(st_make_valid(st_cast(vor)), st_make_valid(NESLME.mercator)) #clip to EPU
+plot(vorclip, col = 0)
+
+vorclip_att <- vorclip %>% data.frame(geometry = .) %>% st_sf() %>% st_join(., vorsf.mercator)
+
+vorclip_att <- gather(vorclip_att
+                      , 'Prob2000','Prob2001', 'Prob2002','Prob2003'
+                      , 'Prob2004','Prob2005', 'Prob2006','Prob2007'
+                      , 'Prob2008','Prob2009', 'Prob2010','Prob2011'
+                      , 'Prob2012','Prob2013', 'Prob2014','Prob2015'
+                      , 'Prob2016','Prob2017', 'Prob2018','Prob2019'
+                      , key = "Year", value = "Probability")
+
+vorclip_att$Year <- vorclip_att$Year %>% substr(5,8) %>% as.character() %>% as.numeric()#clean up the year labels
+
+# probplot <- ggplot(data = filter(vorclip_att, Year == "Prob2000")) + geom_sf(aes(fill = Probability), lwd=0) + scale_fill_viridis_c()
+# plot(filter(vorclip_att, Year == "Prob2000"))
+
+# for(i in 3:ncol(probmapval)-2)) {}
+# plot(vorclip, col = 0) #plot clipped grid area
+# 
+# ggplot(vorpts) +
+#   geom_point(aes(Lon,Lat, color= probmapval[,i]))
+
+#### Voronoi alternative method #####
+# ggprobmap <- ggplot(data = probmapdf, aes(x=Lon, y=Lat)) +
+#   scale_fill_gradientn("Prob2000", colors = c("blue", "green", "red")) +
+#   scale_color_gradientn("Prob2000", colors = c("blue", "green", "red")) +
+#   coord_quickmap() +
+#   theme_minimal() +
+#   theme(axis.text=element_blank(), axis.title=element_blank())
+# ggprobmap +
+#   geom_point(aes(color=Prob2000), size=0.01) +
+#   geom_path(data=lmepts, aes(X,Y), color="black")
+# 
+# ggprobmap + geom_voronoi(aes(fill="Prob2000"), outline = lmepts)
+# 
+
+# unloadNamespace('ggvoronoi')
+```
+
+```{r, summarize the area}
+#Try this for one subset before writing the functions and loops.
+# vorclip_att$area <- st_area(vorclip_att)
+# area80<- vorclip_att %>% filter(Year == "Prob2001", Probability >= 0.80) #%>%
+# area80$area <- area80 %>% st_area()
+# area80sum <- area80  %>% summarise(area = sum(area))
+
+```
+
+Import fishing effort data. These are VTR records aggregated to 5min squares provided by Ben Galuardi. Try this for one file before writing the functions and loops.
+```{r, effort data}
+
+# Illex2001 <- readGDAL("C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FD_Catch/BG_BrookeW_Illex_spatial_use/Illex_2001.tif")
+# library(raster)
+
+# Illex2001 <- readGDAL("/net/home3/ajones/VASTbrooke/FD_catch/BG_BrookeW_Illex_spatial_use/Illex_2001.tif")
+# Illex2001 <- raster(Illex2001)
+
+# effort01 <- rasterToPolygons(Illex2001, n=8)
+# View(effort01)
+
+# effort01.mercator <- spTransform(effort01, CRSobj=CRS("+proj=utm +zone=19 +datum=WGS84"))
+# effort01.mercator <- st_as_sf(effort01.mercator)
+# effort01.mercator <- st_union(effort01.mercator)
+
+# effortplot <- ggplot(data = effort01.mercator) + geom_sf() 
+# effortplot
+```
+
+Calculate proportion of  habitat that is fished. Try this for one file before writing the functions and loops.
+```{r, fishery footprint as proportion of habitat area}
+
+# footprint <- st_intersection(st_make_valid(st_cast(effort01.mercator)), st_make_valid(area80)) 
+
+# footprintplot <- ggplot(data = footprint) + geom_sf() 
+# footprintplot
+# 
+# unloadNamespace('raster')
+# footprint1 <- st_as_sf(footprint)
+# footprint1$area <- footprint1 %>% st_area()
+# footprintsum<- footprint1 %>% summarise(AREA = sum(area))
+# 
+# footprintsum$area / area80sum$area
+
+```
+
+```{r, resave workspace}
+save.image( "./mod1_02_03_01/mod1_02_03_update.Rdata")
+
+```
+
+#Get ready to repeat the processes across years and probabilitly thresholds. 
+
+Set up lists and matrices to save the outputs.
+```{r, make lists and matrices to save outputs}
+
+probthresh <- c(0.4, 0.6, 0.8) #probability thresholds to use
+effortlist <- vector(mode = "list", length = length(Year_Set)) #a place to store the effort .tifs
+plotlist <- vector(mode = "list", length = length(Year_Set)) #a place to save the plots for each year
+## probabilityspatiallist <- vector(mode = "list", length = length(Year_Set)-1) #a place to save the spatial objects for each year
+effortdat <- vector(mode = "list", length = length(Year_Set)) #a place to save the spatial objects for each year
+
+probabilityplots <- vector(mode = "list", length = length(Year_Set)) #a place to save the spatial objects for each year
+effortplots <- vector(mode = "list", length = length(Year_Set)) #a place to save the spatial objects for each year
+
+footprintarea <- matrix(data = NA, nrow = length(Year_Set), ncol = length(probthresh)) #fishing effort area matrix by year and threshold
+habitatarea <- matrix(data = NA, nrow = length(Year_Set), ncol = length(probthresh)) #habitat area matrix by year and threshold
+footprintRATIO <- matrix(data = NA, nrow = length(Year_Set), ncol = length(probthresh)) #ratio matrix by year and threshold
+
+# effortlist <- vector(mode = "list", length = length(Year_Set)-1)
+```
+
+Write a  function to summarize voronoi areas by probability value.
+```{r, voronoi function}
+voronoiprobfun <- function(vorclip_att, year, prob) {
+areaX<- vorclip_att %>% filter(Year == year, Probability >= prob) 
+areaX$area <- areaX %>% st_area()
+areaX
+}
+```
+
+Write a function to  manipulate effort raster files.
+```{r}
+
+myrasterfun <- function(illexeffort) {
+  effort_i <- raster(illexeffort)
+  effort_i_poly <- rasterToPolygons(effort_i, n=8)
+  effort_i_merc <- spTransform(effort_i_poly, CRSobj=CRS("+proj=utm +zone=19 +datum=WGS84"))
+  effort_i_merc <- st_as_sf(effort_i_merc) %>%
+                  st_union()
+  effort_i_merc
+} 
+
+```
+
+
+Loop through years (outer loop) to import all of the effort files, prepare them for analysis, calculate fishery footprint as a ratio of the area fished to habitat area, and save plots and spatial data. For each year, consider multiple thresholds of X% probability of occurrence (inner loop). *Note year indexing starts with 2001 because the Illex_2000.tif file is corrupt. Need to update when the repaired file is received.
+```{r}
+
+effortfilelocation <- "/net/home3/ajones/VASTbrooke/FD_catch/BG_BrookeW_Illex_spatial_use"
+# effortfilelocation <- "C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FD_catch/BG_BrookeW_Illex_spatial_use"
+library(raster)
+
+for(i in 1:length(Year_Set)) {
+  probspatial <- vector(mode = "list", length = length(probthresh))
+  footprintspatial <- vector(mode = "list", length = length(probthresh))
+  
+  for(j in 1:length(probthresh)){
+   areaX <- voronoiprobfun(vorclip_att = vorclip_att, year = Year_Set[i], prob = probthresh[j])
+   areaXsum <- areaX  %>% summarise(AREA = sum(area))
+
+   effort_i <- readGDAL(paste0(effortfilelocation,"/Illex_", Year_Set[i], ".tif"))
+   effort_i_merc <- myrasterfun(effort_i)
+
+   footprintX <- st_intersection(st_make_valid(st_cast(effort_i_merc)), st_make_valid(areaX))
+   footprintX <- st_as_sf(footprintX)
+   footprintX$area <- st_area(footprintX)
+   footprintplotX <- ggplot(data = footprintX) + geom_sf()
+   footprintXsum <- footprintX %>% summarize(AREA = sum(area))
+
+   footprintarea[i,j] <- footprintXsum$AREA / (1000^2) #convert m^2 to km^2
+   habitatarea[i,j] <- areaXsum$AREA  / (1000^2) #convert m^2 to km^2
+   footprintRATIO[i,j] <- (footprintXsum$AREA / areaXsum$AREA)
+
+   probspatial[[j]] <- areaX
+   footprintspatial[[j]] <- footprintX
+  } #close loop over probability thresholds
+  
+  ## probabilityspatiallist[[i]] <- probspatial
+  effortlist[[i]] <- footprintspatial
+  ## probabilityplots[[i]] <- ggplot(data = filter(vorclip_att, Year == i)) + 
+  ##   geom_sf(aes(fill = Probability), lwd=0) + scale_fill_viridis_c()
+  effortdat[[i]] <- effort_i_merc
+} #close loop over years
+
+
+```
+
+
+Total effort area (including outside of habitat area)
+```{r, total effort area}
+totaleffortarea <- matrix(data = NA, nrow = length(Year_Set), ncol = 1) #fishing effort area matrix 
+
+effortfilelocation <- "/net/home3/ajones/VASTbrooke/FD_catch/BG_BrookeW_Illex_spatial_use"
+# effortfilelocation <- "C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FD_catch/BG_BrookeW_Illex_spatial_use"
+library(raster)
+
+for(i in 1:length(Year_Set)) {
+
+   effort_i <- readGDAL(paste0(effortfilelocation,"/Illex_", Year_Set[i], ".tif"))
+   effort_i_merc <- myrasterfun(effort_i)
+
+   totaleffortX <- st_as_sf(effort_i_merc)
+   totaleffortX$area <- st_area(totaleffortX)
+   totaleffortsum <- totaleffortX %>% summarize(AREA = sum(area))
+
+   totaleffortarea[i] <- totaleffortsum$AREA / (1000^2) #convert m^2 to km^2
+
+} #close loop over years
+
+
+```
+
+Finishing touches: name the rows and columns of the output matrices. Save them as .csv files.
+```{r}
+footprintarea <- cbind(Year_Set[1:length(Year_Set)], footprintarea)
+names(footprintarea) = c("Year", paste0("Prob_", probthresh*100))
+write_csv(footprintarea, paste0(DateFile, "/effort.csv"))
+
+habitatarea <-   as.data.frame(cbind(Year_Set[1:length(Year_Set)], habitatarea))
+names(habitatarea) = c("Year", paste0("Prob_", probthresh*100))
+write_csv(habitatarea, paste0(DateFile, "/habitat.csv"))
+
+footprintRATIO <- as.data.frame(cbind(Year_Set, footprintRATIO))
+names(footprintRATIO) = c("Year", paste0("Prob_", probthresh*100))
+write_csv(footprintRATIO, paste0(DateFile, "/footprintratio.csv"))
+
+totaleffortarea <- as.data.frame(cbind(Year_Set[1:length(Year_Set)], totaleffortarea))
+names(totaleffortarea) = c("Year", "EffortArea")
+write_csv(totaleffortarea, paste0(DateFile, "/totaleffort.csv"))
+
+print("Proportion of Habitat Area Fished", quote = FALSE)
+print("Habitat defined as 40, 60, or 80% Probability of Occurrence", quote = FALSE)
+kable(footprintRATIO)
+
+```
+
+```{r, get coastline data}
+reg = map_data("world2Hires")
+reg = subset(reg, region %in% c('Canada', 'USA'))
+reg$long = (360 - reg$long)*-1 #don't use this
+```
+
+```{r, probability of occurrence maps}
+
+# #create a map for a single year of probability of occurrence
+# probpanelone <- ggplot(data = filter(vorclip_att, Year == 2000)) + 
+#   geom_sf(aes(fill = Probability), lwd=0) + 
+#   scale_fill_viridis_c() +
+#   ggtitle(Year_Set[1])
+# #show the plot with effort overlaid:
+# probpanelone + geom_sf(data = effortdat[[2]], aes(color="red"), alpha = 0) +  guides(color = FALSE) 
+
+# #map the probabilities and facet over year
+# probpanels <- ggplot(data = filter(vorclip_att, Year >= 2000)) + 
+#   geom_sf(aes(fill = Probability), lwd=0) + 
+#   facet_wrap(~as.factor(Year)) +
+#   scale_fill_viridis_c()
+
+##update to include land layer
+probpanelone_v2<- ggplot() + 
+    geom_sf(data = vorclip_att[which(vorclip_att$Year==2000),,]  %>% st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability), color = NA, lwd=0) #+
+    scale_fill_viridis_c() +
+    new_scale('fill') +
+    geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') + 
+    ggtitle(Year_Set[1]) +
+    geom_sf(data = effortdat[[1]], aes(color="red"), alpha = 0) +  guides(color = FALSE) + 
+    coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) 
+
+
+#an alternateplot with categorized probabilities
+#bin the probabilities
+vorclip_att$Probability2 <- ifelse(is.na(vorclip_att$Probability), NA, 
+                                   cut(na.omit(vorclip_att$Probability)
+                                       , breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1.0)
+                                       , labels = c("Less than 20%", "At least 20%"
+                                                    , "At least 40%", "At least 60%"
+                                                    , "Atleast 80%")
+                                       ))
+
+
+#an alternateplot with categorized probabilities
+probpanelscat <- ggplot(data = filter(vorclip_att, Year >= 2000)) +
+  geom_sf(aes(fill = Probability2), lwd=0) +
+  facet_wrap(~as.factor(Year)) +
+  scale_fill_brewer(palette = "Purples")
+
+#save the probability maps as a jpg image file ... much faster than pdf
+ggsave(file = paste0(DateFile, "/mod1_02_03_map_results.jpg")
+       , probpanels, device = "jpeg", width = 10, height = 10, unit = "in")
+
+
+ggsave(file = paste0(DateFile, "/mod1_02_03_map_results_probcategory.jpg")
+       , probpanelscat, device = "jpeg", width = 10, height = 10, unit = "in")
+
+##### Make probability maps with effort overlaid. Loop through each year, then stitch the panels together.
+library(patchwork)
+
+prmaps <- list()
+prmapscat <- list()
+
+for (i in 1:length(Year_Set)){
+  # probpanel <- ggplot() +
+  #   geom_sf(data = filter(vorclip_att, Year == Year_Set[i]) %>% st_transform(crs="+proj=longlat +datum=WGS84")) + 
+  # geom_sf(aes(fill = Probability), lwd = 0) + 
+  #   geom_sf(data = effortdat[[i]], aes(color="red"), alpha = 0) +  
+  #   theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5)) +
+  #   scale_fill_viridis_c() +
+  #   guides(color = FALSE) +
+  #   ggtitle(Year_Set[i])
+  # prmaps[[i]] <- probpanel
+  # 
+  probpanel <- ggplot() + 
+    geom_sf(data = vorclip_att[which(vorclip_att$Year== Year_Set[i]),,]  %>% st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability), color = NA, lwd = 0) +
+    scale_fill_viridis_c() +
+    geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') + 
+    ggtitle(Year_Set[i]) +
+    geom_sf(data = effortdat[[i]], aes(color="red"), alpha = 0) +  
+    guides(color = FALSE) + 
+    coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+  prmaps[[i]] <- probpanel
+  
+  # probpanelcat <- ggplot(data = filter(vorclip_att, Year == Year_Set[i])) +
+  #   geom_sf(aes(fill = Probability2), lwd = 0) +
+  #   scale_fill_brewer(palette = "Purples") +
+  #   geom_sf(data = effortdat[[i]], aes(color="red"), alpha = 0) +
+  #   theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5)) +
+  #   guides(color = FALSE) +
+  #   ggtitle(Year_Set[i])
+  # prmapscat[[i]] <- probpanelcat
+
+    probpanelcat <- ggplot() +
+    geom_sf(data = vorclip_att[which(vorclip_att$Year== Year_Set[i]),,] %>% st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability2), color = NA, lwd = 0) +
+    scale_fill_brewer(palette = "Purples") +
+    geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
+    ggtitle(Year_Set[i]) +
+    geom_sf(data = effortdat[[i]], aes(color="red"), alpha = 0) +
+    guides(color = FALSE) +
+    coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+  prmapscat[[i]] <- probpanelcat
+
+}
+
+
+themeleft <- theme(plot.title = element_text(hjust = 0.5)
+                  , axis.ticks.x = element_blank()
+                  , axis.text.x = element_blank()
+                  , axis.title.x = element_blank())
+
+themeinner <- theme(plot.title = element_text(hjust = 0.5)
+                    , axis.ticks = element_blank()
+                    , axis.text.x = element_blank()
+                    , axis.text.y = element_blank()
+                    , axis.title = element_blank())
+
+themecorner <- theme(plot.title = element_text(hjust = 0.5))
+
+themebottom <- theme(plot.title = element_text(hjust = 0.5)
+                     , axis.ticks.y = element_blank()
+                     , axis.text.y= element_blank()
+                     , axis.title.y = element_blank())
+
+probgradientpatch <-
+  (prmaps[[1]] + ggtitle(Year_Set[1]) + themeleft) +
+  (prmaps[[2]] + ggtitle(Year_Set[2]) + themeinner) +
+  (prmaps[[3]] + ggtitle(Year_Set[3]) + themeinner) +
+  (prmaps[[4]] + ggtitle(Year_Set[4]) + themeinner) +
+  (prmaps[[5]] + ggtitle(Year_Set[5]) + themeleft) +
+  (prmaps[[6]] + ggtitle(Year_Set[6]) + themeinner) +
+  (prmaps[[7]] + ggtitle(Year_Set[7]) + themeinner) +
+  (prmaps[[8]] + ggtitle(Year_Set[8]) + themeinner) +
+  (prmaps[[9]] + ggtitle(Year_Set[9]) + themeleft) +
+  (prmaps[[10]] + ggtitle(Year_Set[10]) + themeinner) +
+  (prmaps[[11]] + ggtitle(Year_Set[11]) + themeinner) +
+  (prmaps[[12]] + ggtitle(Year_Set[12]) + themeinner) +
+  (prmaps[[13]] + ggtitle(Year_Set[13]) + themeleft) +
+  (prmaps[[14]] + ggtitle(Year_Set[14]) + themeinner) +
+  (prmaps[[15]] + ggtitle(Year_Set[15]) + themeinner) +
+  (prmaps[[16]] + ggtitle(Year_Set[16]) + themeinner) +
+  (prmaps[[17]] + ggtitle(Year_Set[17]) + themecorner) +
+  (prmaps[[18]] + ggtitle(Year_Set[18]) + themebottom) +
+  (prmaps[[19]] + ggtitle(Year_Set[19]) + themebottom) +
+  (prmaps[[20]] + ggtitle(Year_Set[20]) + themebottom) +
+ plot_layout(ncol = 4, nrow = 5, guides = "collect")
+ # plot_layout(ncol = 4, nrow = 5, guides = NULL)
+
+ggsave(file = paste0(DateFile, "/mod1_02_03_probgradient_effort.jpg")
+       , probgradientpatch, device = "jpeg", width = 10, height = 10, unit = "in")
+
+probcategorypatch <-
+  (prmapscat[[1]] + ggtitle(Year_Set[1]) + themeleft) +
+  (prmapscat[[2]] + ggtitle(Year_Set[2]) + themeinner) +
+  (prmapscat[[3]] + ggtitle(Year_Set[3]) + themeinner) +
+  (prmapscat[[4]] + ggtitle(Year_Set[4]) + themeinner) +
+  (prmapscat[[5]] + ggtitle(Year_Set[5]) + themeleft) +
+  (prmapscat[[6]] + ggtitle(Year_Set[6]) + themeinner) +
+  (prmapscat[[7]] + ggtitle(Year_Set[7]) + themeinner) +
+  (prmapscat[[8]] + ggtitle(Year_Set[8]) + themeinner) +
+  (prmapscat[[9]] + ggtitle(Year_Set[9]) + themeleft) +
+  (prmapscat[[10]] + ggtitle(Year_Set[10]) + themeinner) +
+  (prmapscat[[11]] + ggtitle(Year_Set[11]) + themeinner) +
+  (prmapscat[[12]] + ggtitle(Year_Set[12]) + themeinner) +
+  (prmapscat[[13]] + ggtitle(Year_Set[13]) + themeleft) +
+  (prmapscat[[14]] + ggtitle(Year_Set[14]) + themeinner) +
+  (prmapscat[[15]] + ggtitle(Year_Set[15]) + themeinner) +
+  (prmapscat[[16]] + ggtitle(Year_Set[16]) + themeinner) +
+  (prmapscat[[17]] + ggtitle(Year_Set[17]) + themecorner) +
+  (prmapscat[[18]] + ggtitle(Year_Set[18]) + themebottom) +
+  (prmapscat[[19]] + ggtitle(Year_Set[19]) + themebottom) +
+  (prmapscat[[20]] + ggtitle(Year_Set[20]) + themebottom) +
+ plot_layout(ncol = 4, nrow = 5, guides = "collect")
+
+ggsave(file = paste0(DateFile, "/mod1_02_03_probcategory_effort.jpg")
+       , probcategorypatch, device = "jpeg", width = 10, height = 10, unit = "in")
+
+```
+
+```{r, map of survey data}
+NWA_illex_data$Survey <- as.character(NWA_illex_data$Vessel) %>% 
+  replace(list = which(NWA_illex_data$Vessel %in% c("Albatros", "Bigelow")), values = "NEFSC") %>% as.factor()
+NWA_illex_data$Pres <- as.factor(NWA_illex_data$Pres)
+
+cbpalette <- c("#000000", "#56B4E9", "#D55E00")
+
+surveycoverage <- ggplot() +
+  geom_point(data = NWA_illex_data, aes(x = Lon, y = Lat, color = Survey, shape = Pres), alpha = 0.5) +
+  scale_shape_manual(values = c(4,1)) +
+  scale_color_manual(values = cbpalette) +
+  geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'grey20') +
+  coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+  facet_wrap(~Year) +
+  theme_bw()
+surveycoverage
+
+ggsave(file = paste0(DateFile, "/surveycoverage.jpg")
+       , surveycoverage, device = "jpeg", width = 10, height = 10, unit = "in")
+
+
+```
+
+```{r, resave workspace}
+save.image(file=paste0(DateFile, "/mod1_02_03_update_results_02_28.Rdata"))
+# save.image("C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FI_surveysl/NEFSC_fallBTS_VAST_output/mod1_02_03_01/mod1_02_03_update_results_02_25.Rdata")
+
+```
+
+
+
