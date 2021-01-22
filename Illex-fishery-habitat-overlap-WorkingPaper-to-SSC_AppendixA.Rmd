@@ -6,7 +6,9 @@ output: html_document
 editor_options: 
   chunk_output_type: console
 ---
-  
+
+TEST TEST TEST
+
 ```{r, setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 require("knitr")
