@@ -1,0 +1,247 @@
+---
+title: "Define a custom VAST region for the NWA including offshore and inshore inshore strata"
+author: "Brooke L. Wright"
+date: "9/14/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require("knitr")
+# opts_knit$set(root.dir = "") #set the working directory to use when knitting the file
+# setwd("") #set the working directory to use when running code chunks
+
+```
+
+### Purpose
+
+This is a script to define a custom VAST region for the Northwest Atlantic that includes inshore strata in addtion to offshore strata.
+
+#### Load Packages
+
+```{r libraries}
+library(VAST) 
+library(tidyverse)
+library(sp)
+library(maps)
+library(mapdata)
+library(sf)
+library(rgdal)
+# library(rgdal)
+# library(rgeos)
+# library(lwgeom)
+```
+
+
+### Strata
+
+```{r read in strata shapefile}
+stratast <- st_read('./strata/strata.shp')
+plot(stratast)
+stratast$area <- st_area(stratast)
+stratast1 <- stratast[,c(1,2,9,10)]
+stratast1$isnull <- ifelse((stratast1$FINSTR_ID==0 & stratast1$STRATA==0), "Y", "N")
+stratast1$weirdid <- ifelse((stratast1$FINSTR_ID==7999), "inshoresouth999", 
+                            ifelse((stratast1$FINSTR_ID==8999), "offshoresouth999",
+                                   "OK"))
+# strata1 <- strata %>% summarise(area = sum(area))
+
+```
+
+```{r read in map data}
+reg = map_data("world2Hires")
+reg = subset(reg, region %in% c('Canada', 'USA'))
+reg$long = (360 - reg$long)*-1 
+```
+
+```{r make the strata map, echo = FALSE}
+stratamap <- ggplot() + 
+  geom_sf(data = stratast1 %>% st_transform(crs="+proj=longlat +datum=WGS84"), color = "gray20", aes(fill = isnull)) +
+  geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = "black") +
+  coord_sf(xlim = c(-80,-65), ylim = c(32,45)) +
+  ggtitle("Survey Strata")
+
+stratamap
+
+nullstratamap <- ggplot() + 
+  geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = "black") +
+  geom_sf(data = stratast1[which(stratast1$isnull=="Y"),] %>% st_transform(crs="+proj=longlat +datum=WGS84"), color = "gray20", aes(fill = isnull)) +
+  coord_sf(xlim = c(-80,-65), ylim = c(32,45)) +
+  ggtitle("Null Survey Strata")
+nullstratamap
+
+print("ah ha! strata listed as all zeros are islands", quote = FALSE)
+
+weirdstrataidmap <- ggplot() + 
+  geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = "black") +
+  geom_sf(data = stratast1 %>% st_transform(crs="+proj=longlat +datum=WGS84"), color = "gray20", aes(fill = weirdid)) +
+  coord_sf(xlim = c(-80,-65), ylim = c(32,45)) +
+  ggtitle("999 Survey Strata")
+weirdstrataidmap
+
+print("Strata labled 7999 and 8999 are outside of the northeast survey area")
+
+```
+
+
+### Survey tow locations
+
+```{r read in data}
+load("./FICatchData/FIsurveydata_formatted.Rdata")
+
+NWA_illex_data <- rbind(NMFSfall
+                        , NEAMAP
+                        , MENH
+                        , MAfall
+                        , RITRAWL
+                        , NYTRAWL
+                        , NJTRAWL
+                        ) 
+NWA_illex_data$Lat <- as.numeric(as.character(NWA_illex_data$Lat))
+NWA_illex_data$Lon <- as.numeric(as.character(NWA_illex_data$Lon))
+NWA_illex_data$Year <- as.numeric(as.character(NWA_illex_data$Year))
+NWA_illex_data$Pres <- as.factor(NWA_illex_data$Pres)
+NWA_illex_data <- NWA_illex_data %>% rename(Survey = Vessel) 
+NWA_illex_data$Survey = ifelse(NWA_illex_data$Survey == "Albatros" | NWA_illex_data$Survey == "Bigelow"
+                                , yes = "NMFS"
+                                , no = NWA_illex_data$Survey) %>% as.factor()
+summary(NWA_illex_data$Survey)
+
+```
+
+```{r clean up the global environment, echo = FALSE}
+rm(MAfall, MAspring, NJTRAWL, NYTRAWL, RITRAWL)
+rm(NMFSfall, MENH, NEAMAP)
+
+```
+
+```{r map the survey locations, echo = FALSE}
+# cbpalette <- c("#000000", "#56B4E9", "#D55E00") #create a custom colorblind-friendly palette
+
+# Make a custom color and shape scale
+library(RColorBrewer)
+myColors <- brewer.pal(8, "Set1") 
+names(myColors) <- levels(as.factor(NWA_illex_data$Survey))
+colScale <- scale_colour_manual(name = "Survey",values = myColors)
+
+pdf(file = "C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FI_surveys/surveydatainstrata.pdf")
+
+for(i in 2000:2019) {
+  surveycoverage <- ggplot() +
+    geom_sf(data = stratast1 %>% st_transform(crs="+proj=longlat +datum=WGS84"), color = "gray40") +
+    geom_point(data = filter(NWA_illex_data, Year==i), aes(x = Lon, y = Lat, color = Survey, shape = Pres), alpha = 0.5) +
+    scale_shape_manual(values = c(4,1)) +
+    colScale +
+    # scale_color_manual(values = cbpalette) +
+    geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = "black") +
+    coord_sf(xlim = c(-80,-65), ylim = c(32,45)) +
+    # facet_wrap(~Year) +
+    ggtitle(i)
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=30, hjust=1, vjust=1))
+  print(surveycoverage)
+  }
+dev.off()
+
+# ggsave(file = "surveycoverage.jpg", surveycoverage, device = "jpeg", width = 10, height = 10, unit = "in")
+
+```
+
+
+### Make grid from shapefile
+Now that we have read in the survey strata shapefile and have visualized our survey data, we need to transform the survey strata to UTM, set the grid resolution and make the grid. Then we'll subset the relevant portion of the grid and export it to use as the extrapolation grid.
+*This section is a modified version of code by Cecilia O'Leary, available at https://github.com/ceciliaOLearySBU/MakeGrids/blob/master/MakeGrids
+
+```{r read in shapefile and transform projection}
+
+strata <- readOGR('./strata/strata.shp')
+##transform shapefile into decimal degrees
+strata <- spTransform(strata, CRS("+proj=longlat +lat_0=90 +lon_0=180 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0 "))
+
+
+plot(strata, axes = T)
+head(strata@data)
+
+lon <- sum(bbox(strata)[1,])/2 #retrieves spatial bounding box from spatial data [,1] is longitude
+utmzone <- floor((lon + 180) / 6) + 1 #convert decimal degrees to utm zone for average longitude, use for new CRS
+
+crs1 <- strata@proj4string
+crs1 <- CRS('+proj=longlat +ellps=WGS84 +no_defs') 
+strata@proj4string <- crs1
+
+crs2 <- CRS(paste0("+proj=utm +zone=",utmzone," +ellps=WGS84 +datum=WGS84 +units=m +no_defs "))
+strata1 <- spTransform(strata, crs2) #convert strata to utm
+strata1@data$isnull <- ifelse((strata1@data$FINSTR_ID==0 & strata1@data$STRATA==0), "Y", "N")
+strata1 <- strata1[which(strata1@data$isnull=="N"),]
+strata1 <- strata1[which(strata1@data$FINSTR_ID!=7999 & strata1@data$FINSTR_ID!=8999),]
+
+# test <- strata1@data %>% filter(isnull=="N", FINSTR_ID!=7999 & FINSTR_ID!=8999)
+
+length(unique(strata1$FINSTR_ID))
+length(unique(strata1$STRATA))
+nrow(strata1[which(strata1@data$FINSTR_ID==0),])
+nrow(strata1[which(strata1@data$STRATA==0),])
+View(strata1@data)
+strata1 <- strata1[-c(which(strata1@data$FINSTR_ID==7500 & strata1@data$STRATA==0)),]
+
+
+plot(strata1,axes=T)
+```
+
+```{r make grid}
+
+# CELL_SIZE <- 25000 #size of grid in meters 
+# CELL_SIZE <- 3000 #size of grid in meters 
+CELL_SIZE <- 3000*1.852 #size of grid in meters ... make the grid 3x3 nautical miles
+
+st_bbox(strata1) #get bounding box info
+grid <- st_make_grid(strata1,cellsize = CELL_SIZE, what = "centers") #cellsize in meters, creates grid using sf() package = create a square or hexagonal grid over the bounding box of an sf or sfc object
+plot(strata1,axes=T)
+plot(grid, axes = TRUE, add = TRUE, col = "red")
+grid_spatial <- as(grid, "Spatial") #convert grid to Spatial Points
+grid_spatial_2 <- as(grid_spatial, "SpatialPointsDataFrame") #convert Spatial Points to SpatialPointsDataFrame
+grid_spatial_2@data <- over(grid_spatial,strata1) #combine shapefile data (strata1) with Spatial Points (grid_spatial) & place in SpatialPointsDataFrame data 
+# (this provides you with your strata identifier (here called Id) in your data frame) 
+
+#put grid in correct/original CRS
+grid1 <- spTransform(grid_spatial_2, crs1) 
+grid1 <- as.data.frame(grid1) #confirm it's still a data frame
+grid1 <- subset(grid1,FINSTR_ID>=0)
+grid2 <- with(grid1,data.frame(Lon=coords.x1,Lat=coords.x2
+                               ,STRATA
+                               , Area_km2=(CELL_SIZE/1000*CELL_SIZE/1000)
+                               ,1:nrow(grid1)
+                               )) #this is to filter out the grid that does not overlap with your region. REGION can be
+#replaced by whatever your shapefile@data identifier is for your areas/stratas/regions that contain 
+#observations
+
+names(grid2) <- c("Lon","Lat","id","Area_km2","row_number")
+saveRDS(grid2, file = ("./grid_NWA_BTS_3x3nm.rds"))
+
+```
+
+### Use grid in VAST to make extrapolation region
+
+```{r make extrapolation region}
+grid_NWA_BTS <- readRDS("grid_NWA_BTS_3x3nm.rds")
+View(grid_NWA_BTS)
+
+NWA_BTS_boundaries <- c(range(grid_NWA_BTS$Lon), range(grid_NWA_BTS$Lat))
+NWA_BTS_stratalimits <- data.frame(
+  'STRATA' = c("All_areas")
+  , 'west_border' = c(NWA_BTS_boundaries[1])
+  , 'east_border' = c(NWA_BTS_boundaries[2])
+  , 'north_border' = c(NWA_BTS_boundaries[4])
+  , 'south_border' = c(NWA_BTS_boundaries[3])
+)
+
+NWA_BTS_extrap <- FishStatsUtils::make_extrapolation_info(Region = "User"
+                                                          , strata.limits = NWA_BTS_stratalimits
+                                                          , input_grid = grid_NWA_BTS
+                                                          , observations_LL = Data_Geostat[,c("Lat", "Lon")]
+                                                          , flip_around_dateline = FALSE
+                                                          # , zone =  18 # UTM zone; use NA for automatic detection 
+                                                          , projargs = NA)
+```
+
+###
