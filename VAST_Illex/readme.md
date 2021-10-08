@@ -8,3 +8,4 @@ This folder contains files to run a VAST model for northern shortfin squid.
 
 ### Data Acknowledgements 
 Sara Murray, James Gartland, Rebecca Peters, KimMcKown, Matt Camisa, and Linda Barry provided data from state inshore surveys.
+Phillip Greyson and Nancy Shackle provided the Canadian DFO survey data.
